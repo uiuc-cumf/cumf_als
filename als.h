@@ -678,6 +678,6 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
 		const int* cooRowIndexHostPtr, float* thetaTHost, float * XTHost,
 		const int * cooRowIndexTestHostPtr, const int * cooColIndexTestHostPtr, const float * cooValHostTestPtr,
 		const int m, const int n, const int f, const long nnz, const long nnz_test, const float lambda,
-		const int ITERS, const int X_BATCH, const int THETA_BATCH, const int DEVICEID);
+		const int ITERS, const int X_BATCH, const int THETA_BATCH);
 
 #endif /* ALS_H_ */

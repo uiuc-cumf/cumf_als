@@ -721,6 +721,10 @@ void updateXWithCGHost(float * A, float * x, float * b, const int batchSize, con
 	#endif
 }		
 
+void updateXWithCGHostAsync(float * A, float * x, float * b, const int batchSize, const int f, const float cgIter, cudaStream_t *stream){
+	updateXWithCGKernel<<<batchSize, f, (4*f+4)*sizeof(float), *stream>>>(A, x, b, batchSize, f, cgIter);
+
+}
 
 //fused kernel, use thetaT to update XT
 __global__ void

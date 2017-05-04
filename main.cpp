@@ -136,6 +136,24 @@ int main(int argc, char **argv) {
 	printf("\n");
 	
 	#endif
+
+	int nDevices;
+	cudaGetDeviceCount(&nDevices);
+
+	printf("This node has %d CUDA devices\n", nDevices);
+	for (int i = 0; i < nDevices; i++) {
+	    cudaDeviceProp prop;
+	    cudaGetDeviceProperties(&prop, i);
+	    printf("Device Number: %d\n", i);
+	    printf("  Device name: %s\n", prop.name);
+	    printf("  Memory Clock Rate (KHz): %d\n",
+	           prop.memoryClockRate);
+	    printf("  Memory Bus Width (bits): %d\n",
+	           prop.memoryBusWidth);
+	    printf("  Peak Memory Bandwidth (GB/s): %f\n\n",
+	           2.0*prop.memoryClockRate*(prop.memoryBusWidth/8)/1.0e6);
+	}
+
 	double t0 = seconds();
 	
 	doALS(csrRowIndexHostPtr, csrColIndexHostPtr, csrValHostPtr,
@@ -143,7 +161,7 @@ int main(int argc, char **argv) {
 			cooRowIndexHostPtr, thetaTHost, XTHost,
 			cooRowIndexTestHostPtr, cooColIndexTestHostPtr, cooValHostTestPtr,
 			m, n, f, nnz, nnz_test, lambda,
-			ITERS, X_BATCH, THETA_BATCH, DEVICEID);
+			ITERS, X_BATCH, THETA_BATCH);
 	printf("\ndoALS takes seconds: %.3f for F = %d\n", seconds() - t0, f);
 
 	/*

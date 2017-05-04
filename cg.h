@@ -29,6 +29,8 @@ int updateXWithCG(const int batchSize, const int batchOffset, float * ythetaT, f
 		
 void updateXWithCGHost(float * A, float * x, float * b, const int batchSize, const int f, const float cgIter);
 
+void updateXWithCGHostAsync(float * A, float * x, float * b, const int batchSize, const int f, const float cgIter, cudaStream_t *stream);
+
 void updateXWithCGHost_tt_fp16(float * A, float * x, float * b, const int batchSize, const int f, const float cgIter);
 
 void alsUpdateFeature100Host(const int batch_offset,
