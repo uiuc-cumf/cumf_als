@@ -212,7 +212,7 @@ LIBRARIES +=-lcublas -lcusparse #-llapack -lblas -lmagma -lm -ltest -llapacktest
 # Target rules
 all: build
 
-build: clean als als_multi2
+build: clean als als_multi2 als_mpi
 debug:	clean
 debug:	ALL_CCFLAGS+=-DDEBUG
 debug:	build 
@@ -221,10 +221,20 @@ als.o:als.cu
 	$(NVCC) $(INCLUDES) $(ALL_CCFLAGS) $(GENCODE_FLAGS) -lineinfo -o $@ -c $<
 als_multi2.o:als_multi2.cu
 	$(NVCC) $(INCLUDES) $(ALL_CCFLAGS) $(GENCODE_FLAGS) -lineinfo -o $@ -c $<
+als_mpi.o:als_mpi.cu
+	$(NVCC) $(INCLUDES) $(ALL_CCFLAGS) $(GENCODE_FLAGS) -lineinfo -o $@ -c $<
 cg.o:cg.cu
+	$(NVCC) $(INCLUDES) $(ALL_CCFLAGS) $(GENCODE_FLAGS) -lineinfo -o $@ -c $<
+cg_mpi.o:cg_mpi.cu
 	$(NVCC) $(INCLUDES) $(ALL_CCFLAGS) $(GENCODE_FLAGS) -lineinfo -o $@ -c $<
 main.o:main.cpp
 	$(NVCC) $(INCLUDES) $(ALL_CCFLAGS) $(GENCODE_FLAGS) -lineinfo -o $@ -c $<
+cuda_wrapper.o:cuda_wrapper.cpp
+	$(NVCC) $(INCLUDES) $(ALL_CCFLAGS) $(GENCODE_FLAGS) -lineinfo -o $@ -c $<
+main_mpi.o:main_mpi.cpp
+	mpiCC -c $< -o $@
+mpi_utils.o:mpi_utils.cpp
+	mpiCC -c $< -o $@
 host_utilities.o:host_utilities.cpp
 	$(NVCC) $(INCLUDES) $(ALL_CCFLAGS) $(GENCODE_FLAGS) -lineinfo -o $@ -c $<
 device_utilities.o:device_utilities.cu
@@ -233,10 +243,12 @@ als: host_utilities.o device_utilities.o cg.o als.o main.o
 	$(NVCC) $(ALL_LDFLAGS) $(GENCODE_FLAGS) -lineinfo -o $@ $+ $(LIBRARIES)
 als_multi2: host_utilities.o device_utilities.o cg.o als_multi2.o main.o
 	$(NVCC) $(ALL_LDFLAGS) $(GENCODE_FLAGS) -lineinfo -o $@ $+ $(LIBRARIES)
+als_mpi: host_utilities.o device_utilities.o cg_mpi.o als_mpi.o main_mpi.o cuda_wrapper.o mpi_utils.o
+	mpiCC -openmp -o $@ $+ $(LIBRARIES) -L/usr/local/cuda-7.5/lib64 -lcudart -lgomp -lpthread
 #netflix
 run: main
 	 ./main 17770 480189 100 99072112 1408395 0.048 1 3 ./data/netflix/
 clean:
-	rm -f host_utilities.o device_utilities.o als.o als_multi2.o als als_multi2 main.o cg.o
+	rm -f host_utilities.o device_utilities.o als.o als_multi2.o als als_multi2 als_mpi main.o main_mpi.o cuda_wrapper.o cg.o
 
 clobber: clean

@@ -632,14 +632,12 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
 
     	cudacall(cudaMalloc((void** ) &cscVal[device], nnz * sizeof(cscVal[0][0])));
     	cudacall(cudaMemcpy(cscVal[device], cscValHostPtr,(size_t ) (nnz * sizeof(cscVal[0][0])),cudaMemcpyHostToDevice));
+
+	    cudacall(cudaDeviceSetCacheConfig(cudaFuncCachePreferShared));
+	    //64-bit smem access
+	    //http://acceleware.com/blog/maximizing-shared-memory-bandwidth-nvidia-kepler-gpus
+	    cudaDeviceSetSharedMemConfig(cudaSharedMemBankSizeEightByte);
     }
-    cudacall(cudaSetDevice(0));
-
-    cudacall(cudaDeviceSetCacheConfig(cudaFuncCachePreferShared));
-    //64-bit smem access
-    //http://acceleware.com/blog/maximizing-shared-memory-bandwidth-nvidia-kepler-gpus
-    cudaDeviceSetSharedMemConfig(cudaSharedMemBankSizeEightByte);
-
 
     //initialize cublas, cusparse
     cublasHandle_t handle[nDevices];
@@ -779,7 +777,7 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
 
                         for (int j = 0; j < nDevices; ++j) {
                             if (j != device) {
-                                cudacall(cudaMemcpyPeerAsync(&XT[j][batch_offset*f], j, &XT[device][batch_offset*f], device, batch_size * f * sizeof(XT[0][0]), stream[0][device]));
+                                cudacall(cudaMemcpyPeerAsync(&XT[j][batch_offset*f], j, &XT[device][batch_offset*f], device, batch_size * f * sizeof(XT[0][0]), stream[1][device]));
                             }
                         }
 
@@ -788,21 +786,6 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
             }
             
         }
-
-        #pragma omp parallel
-        {
-            int device = omp_get_thread_num();
-
-            cudacall(cudaSetDevice(device));
-            cudacall(cudaStreamSynchronize(stream[1][device]));
-
-            cudacall(cudaFree(tt[device]));
-            cudacall(cudaFree(ythetaT[device]));
-        }
-
-        #ifdef DEBUG
-        printf("update X run %f seconds, gridSize: %d, blockSize %d.\n", seconds() - t0, m, f);
-        #endif
 
         float * xx[nDevices];
         float * yTXT[nDevices];
@@ -813,6 +796,21 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
 
             cudacall(cudaMalloc((void** ) &yTXT[device], f * n * sizeof(yTXT[0][0])));
             cudacall(cudaMalloc((void** ) &yTX[device], n * f * sizeof(yTX[0][0])));
+        }
+
+        #ifdef DEBUG
+        printf("update X run %f seconds, gridSize: %d, blockSize %d.\n", seconds() - t0, m, f);
+        #endif
+
+        #pragma omp parallel
+        {
+            int device = omp_get_thread_num();
+
+            cudacall(cudaSetDevice(device));
+            cudacall(cudaStreamSynchronize(stream[1][device]));
+
+            cudacall(cudaFree(tt[device]));
+            cudacall(cudaFree(ythetaT[device]));
         }
 ///*
         #ifdef DEBUG
