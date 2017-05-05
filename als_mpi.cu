@@ -1261,17 +1261,20 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
         }
 
         float rmse_buff[n_procs][2];
+        rmse_buff[0][0] = 0.0;
+        rmse_buff[0][1] = 0.0;
 
-        //#pragma omp parallel shared(rmse_train) shared(rmse_test)
-        //{
-            //int device = omp_get_thread_num();          
-		for (int device = 0; device < nDevices; ++device) {
+        #pragma omp parallel
+        {
+            int device = omp_get_thread_num();          
 
             cudacall(cudaSetDevice(device_base + device));
 
             cudaDeviceSynchronize();
 
+            #pragma omp atomic
             rmse_buff[0][0] += rmse_train_host[device];
+            #pragma omp atomic
             rmse_buff[0][1] += rmse_test_host[device];
         }
 
