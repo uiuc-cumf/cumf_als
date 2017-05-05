@@ -9,6 +9,10 @@ void *MPI_Isend_float_wrapper(float *buff, size_t sz, int dst, int tag) {
     return (void *) req;
 }
 
+int MPI_Send_float_wrapper(float *buff, size_t sz, int dst, int tag) {
+    return MPI_Send(buff, sz, MPI_FLOAT, dst, tag, MPI_COMM_WORLD);
+}
+
 int MPI_Recv_float_wrapper(float *buff, size_t sz, int src, int tag) {
     MPI_Status stat;
     return MPI_Recv(buff, sz, MPI_FLOAT, src, tag, MPI_COMM_WORLD, &stat);

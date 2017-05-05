@@ -151,8 +151,11 @@ int main_wrapper(int argc, char *argv[], int mpi_rank, int n_procs) {
             cooRowIndexTestHostPtr, cooColIndexTestHostPtr, cooValHostTestPtr,
             m, n, f, nnz, nnz_test, lambda,
             ITERS, X_BATCH, THETA_BATCH, mpi_rank, n_procs);
-    printf("\ndoALS takes seconds: %.3f for F = %d\n", seconds() - t0, f);
-    printf("\nALS Done.\n");
+
+    if (mpi_rank == 0) {
+        printf("\ndoALS takes seconds: %.3f for F = %d\n", seconds() - t0, f);
+        printf("\nALS Done.\n");
+    }
 
     /*
     //write out the model   

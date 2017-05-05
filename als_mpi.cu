@@ -758,8 +758,11 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
     float * errors_test[nDevices];
     float final_rmse = 0;
 
-    int nnz_device = (nnz - 1) / nDevices + 1;
-    int nnz_test_device = (nnz_test - 1) / nDevices + 1;
+    int nnz_node = (nnz - 1) / n_procs + 1;
+    int nnz_test_node = (nnz_test - 1) / n_procs + 1;
+
+    int nnz_device = (nnz_node - 1) / nDevices + 1;
+    int nnz_test_device = (nnz_test_node - 1) / nDevices + 1;
 
     int error_size_train = (nnz_device - 1) / 256 + 1;
     int error_size_test = (nnz_test_device - 1) / 256 + 1;
@@ -848,6 +851,8 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
     double t0 = 0;
     double t1 = 0;
     #endif
+
+    double t_itr = seconds();
 
     printf("*******start iterations...\n");
     for(int iter = 0; iter < ITERS ; iter ++){
@@ -1217,27 +1222,45 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
 
             cudacall(cudaSetDevice(device_base + device));
 
-            printf("Calculate partial RMSE on device %d\n", device);
+            int offset = nnz_node * mpi_rank + nnz_device * device;
 
-            int offset = nnz_device * device;
+            int bound = nnz_node * mpi_rank + nnz_device * (device + 1);
+            if (bound > nnz_node * (mpi_rank + 1)) {
+                bound = nnz_node * (mpi_rank + 1);
+            }
+            if (bound > nnz) {
+                bound = nnz;
+            }
+
+            printf("Calculate partial RMSE on node %d device %d [%d - %d]\n", mpi_rank, device, offset, bound);
 
             RMSE_reduction2<<<error_size_train, 256, 0, stream[0][device]>>>
-                    (offset, csrVal[device], cooRowIndex[device], csrColIndex[device], thetaT[device], XT[device], errors_train[device], nnz, f);
+                    (offset, csrVal[device], cooRowIndex[device], csrColIndex[device], thetaT[device], XT[device], errors_train[device], bound, f);
 
             reduction<<<1, 1024, 0, stream[0][device]>>>(errors_train[device], rmse_train_device[device], error_size_train);
 
             cudacall(cudaMemcpyAsync(rmse_train_host + device, rmse_train_device[device], sizeof(rmse_train_host[0]), cudaMemcpyDeviceToHost, stream[0][device]));
 
-            offset = nnz_test_device * device;
+            offset = nnz_test_node * mpi_rank + nnz_test_device * device;
+
+            bound = nnz_test_node * mpi_rank + nnz_test_device * (device + 1);
+            if (bound > nnz_test_node * (mpi_rank + 1)) {
+                bound = nnz_test_node * (mpi_rank + 1);
+            }
+            if (bound > nnz_test) {
+                bound = nnz_test;
+            }
 
             RMSE_reduction2<<<error_size_test, 256, 0, stream[1][device]>>>
-                    (offset, cooVal_test[device], cooRowIndex_test[device], cooColIndex_test[device], thetaT[device], XT[device], errors_test[device], nnz_test, f);
+                    (offset, cooVal_test[device], cooRowIndex_test[device], cooColIndex_test[device], thetaT[device], XT[device], errors_test[device], bound, f);
 
             reduction<<<1, 1024, 0, stream[1][device]>>>(errors_test[device], rmse_test_device[device], error_size_test);
 
             cudacall(cudaMemcpyAsync(rmse_test_host + device, rmse_test_device[device], sizeof(rmse_test_host[0]), cudaMemcpyDeviceToHost, stream[1][device]));
 
         }
+
+        float rmse_buff[n_procs][2];
 
         //#pragma omp parallel shared(rmse_train) shared(rmse_test)
         //{
@@ -1248,17 +1271,38 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
 
             cudaDeviceSynchronize();
 
-            rmse_train += rmse_train_host[device];
-            rmse_test += rmse_test_host[device];
+            rmse_buff[0][0] += rmse_train_host[device];
+            rmse_buff[0][1] += rmse_test_host[device];
         }
 
-        printf("--------- Train RMSE in iter %d: %f\n", iter, sqrt(rmse_train/nnz));
+        if (mpi_rank == 0) {
+            for (int i = 1; i < n_procs; ++i) {
+                MPI_Recv_float_wrapper(rmse_buff[i], 2, i, i);
+            }
+        } else {
+            MPI_Send_float_wrapper(rmse_buff[0], 2, 0, mpi_rank);
+        }
 
-        final_rmse = sqrt(rmse_test/nnz_test);
-        printf("--------- Test RMSE in iter %d: %f\n", iter, final_rmse);
+        if (mpi_rank == 0) {
+
+            for (int i = 0; i < n_procs; ++i) {
+                rmse_train += rmse_buff[i][0];
+                rmse_test += rmse_buff[i][1];
+            }
+
+            printf("--------- Train RMSE in iter %d: %f\n", iter, sqrt(rmse_train/nnz));
+
+            final_rmse = sqrt(rmse_test/nnz_test);
+            printf("--------- Test RMSE in iter %d: %f\n", iter, final_rmse);
+        }
 
 //*/        
     }
+
+    if (mpi_rank == 0) {
+        printf("%d iterations takes %lf seconds\n", ITERS, seconds() - t_itr);
+    }
+
     cudacall(cudaSetDevice(device_base));
 
     //copy feature vectors back to host

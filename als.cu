@@ -723,6 +723,8 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
 	double t1 = 0;
 	#endif
 
+	double t_itr = seconds();
+
 	printf("*******start iterations...\n");
 	for(int iter = 0; iter < ITERS ; iter ++){
 		#ifdef DEBUG
@@ -1020,6 +1022,7 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
 		cudacall(cudaFree(errors_test));
 //*/		
 	}
+	printf("%d iterations takes %lf seconds\n", ITERS, seconds() - t_itr);
 	//copy feature vectors back to host
 	cudacall(cudaMemcpy(thetaTHost, thetaT, (size_t ) (n * f * sizeof(thetaT[0])), cudaMemcpyDeviceToHost));
 	cudacall(cudaMemcpy(XTHost, XT, (size_t ) (m * f * sizeof(XT[0])), cudaMemcpyDeviceToHost));

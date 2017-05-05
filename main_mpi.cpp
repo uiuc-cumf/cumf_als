@@ -41,7 +41,6 @@ int main(int argc, char **argv) {
 	
 	int ret = main_wrapper(argc, argv, myRank, nProcs);
 
-	MPI_Barrier(MPI_COMM_WORLD);
 	MPI_Finalize();
 
 	return ret;

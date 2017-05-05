@@ -663,6 +663,8 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
     double t1 = 0;
     #endif
 
+    double t_itr = seconds();
+
     printf("*******start iterations...\n");
     for(int iter = 0; iter < ITERS ; iter ++){
         #ifdef DEBUG
@@ -953,18 +955,26 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
             printf("Calculate partial RMSE on device %d\n", device);
 
             int offset = nnz_device * device;
+            int bound = nnz_device * (device + 1);
+            if (bound > nnz) {
+                bound = nnz;
+            }
 
             RMSE_reduction2<<<error_size_train, 256, 0, stream[0][device]>>>
-                    (offset, csrVal[device], cooRowIndex[device], csrColIndex[device], thetaT[device], XT[device], errors_train[device], nnz, f);
+                    (offset, csrVal[device], cooRowIndex[device], csrColIndex[device], thetaT[device], XT[device], errors_train[device], bound, f);
 
             reduction<<<1, 1024, 0, stream[0][device]>>>(errors_train[device], rmse_train_device[device], error_size_train);
 
             cudacall(cudaMemcpyAsync(rmse_train_host + device, rmse_train_device[device], sizeof(rmse_train_host[0]), cudaMemcpyDeviceToHost, stream[0][device]));
 
             offset = nnz_test_device * device;
+            bound = nnz_test_device * (device + 1);
+            if (bound > nnz_test) {
+                bound = nnz_test;
+            }
 
             RMSE_reduction2<<<error_size_test, 256, 0, stream[1][device]>>>
-                    (offset, cooVal_test[device], cooRowIndex_test[device], cooColIndex_test[device], thetaT[device], XT[device], errors_test[device], nnz_test, f);
+                    (offset, cooVal_test[device], cooRowIndex_test[device], cooColIndex_test[device], thetaT[device], XT[device], errors_test[device], bound, f);
 
             reduction<<<1, 1024, 0, stream[1][device]>>>(errors_test[device], rmse_test_device[device], error_size_test);
 
@@ -992,6 +1002,9 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
 
 //*/        
     }
+
+    printf("%d iterations takes %lf seconds\n", ITERS, seconds() - t_itr);
+
     cudacall(cudaSetDevice(0));
 
     //copy feature vectors back to host
