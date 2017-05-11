@@ -531,6 +531,39 @@ get_hermitianT10(const int batch_offset, float* tt,
     }
 }
 
+#define TILE_DIM 32
+#define BLOCK_ROWS 8
+
+__global__ void
+transpose(float *odata, const float *idata, int row, int col, int col_device, int col_offset) {
+
+    __shared__ float tile[TILE_DIM][TILE_DIM + 1];
+
+    int x = blockIdx.x * TILE_DIM + threadIdx.x;
+    int y = blockIdx.y * TILE_DIM + threadIdx.y;
+
+    if (x < col_device && x + col_offset < col) {
+        for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
+            if (y + j < row) {
+                tile[threadIdx.y + j][threadIdx.x] = idata[(y + j) * col + col_offset + x];
+            }
+        }
+    }
+
+    __syncthreads();
+
+    x = blockIdx.y * TILE_DIM + threadIdx.x;  // transpose block offset
+    y = blockIdx.x * TILE_DIM + threadIdx.y;
+
+    if (x < row) {
+        for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
+            if (y + j < col_device && y + j + col_offset < col) {
+                odata[(y + j + col_offset) * row + x] = tile[threadIdx.x][threadIdx.y + j];
+            }
+        }
+    }
+}
+
 
 float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const float* csrValHostPtr,
         const int* cscRowIndexHostPtr, const int* cscColIndexHostPtr, const float* cscValHostPtr,
@@ -704,11 +737,32 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
                     CUSPARSE_OPERATION_TRANSPOSE, m, f, n, nnz, &alpha, descr[device], csrVal[device],
                     csrRowIndex[device], csrColIndex[device], thetaT[device], f, &beta, ytheta[device], m) );
 
-            cublascall(cublasSgeam(handle[device], CUBLAS_OP_T, CUBLAS_OP_N, f, m, &alpha,
-                    (const float * ) ytheta[device], m, &beta, ythetaT[device], f, ythetaT[device], f));
+            //cublascall(cublasSgeam(handle[device], CUBLAS_OP_T, CUBLAS_OP_N, f, m, &alpha,
+                    //(const float * ) ytheta[device], m, &beta, ythetaT[device], f, ythetaT[device], f));
+
+            int m_device = (m - 1) / nDevices + 1;
+            int offset = m_device * device;
+
+            dim3 dimGrid((m_device - 1) / TILE_DIM + 1, (f - 1) / TILE_DIM + 1, 1);
+            dim3 dimBlock(TILE_DIM, BLOCK_ROWS, 1);
+
+            transpose<<<dimGrid, dimBlock>>>(ythetaT[device], (const float *) ytheta[device], f, m, m_device, offset);
 
             cudacall(cudaDeviceSynchronize());
+
+            int size = m_device;
+            if (offset + m_device >= m) {
+                size = m - offset;
+            }
+
+            for (int j = 0; j < nDevices; ++j) {
+                if (j != device) {
+                    cudacall(cudaMemcpyPeerAsync(&ythetaT[j][offset * f], j, &ythetaT[device][offset * f], device, size * f * sizeof(float), stream[j + 1][device]));
+                }
+            }
+
             cudacall(cudaFree(ytheta[device]));
+            cudacall(cudaDeviceSynchronize());
 
         }
         
@@ -836,11 +890,32 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
 	        cusparsecall( cusparseScsrmm2(cushandle[device], CUSPARSE_OPERATION_NON_TRANSPOSE,
 	                CUSPARSE_OPERATION_TRANSPOSE, n, f, m, nnz, &alpha, descr[device], cscVal[device],
 	                cscColIndex[device], cscRowIndex[device], XT[device], f, &beta, yTX[device], n) );
-	        cublascall(cublasSgeam(handle[device], CUBLAS_OP_T, CUBLAS_OP_N, f, n, &alpha,
-	                (const float * ) yTX[device], n, &beta, yTXT[device], f, yTXT[device], f));
+	        //cublascall(cublasSgeam(handle[device], CUBLAS_OP_T, CUBLAS_OP_N, f, n, &alpha,
+	                //(const float * ) yTX[device], n, &beta, yTXT[device], f, yTXT[device], f));
+
+            int n_device = (n - 1) / nDevices + 1;
+            int offset = n_device * device;
+
+            dim3 dimGrid((n_device - 1) / TILE_DIM + 1, (f - 1) / TILE_DIM + 1, 1);
+            dim3 dimBlock(TILE_DIM, BLOCK_ROWS, 1);
+
+            transpose<<<dimGrid, dimBlock>>>(yTXT[device], (const float *) yTX[device], f, n, n_device, offset);
 
             cudacall(cudaDeviceSynchronize());
+
+            int size = n_device;
+            if (offset + n_device >= n) {
+                size = n - offset;
+            }
+
+            for (int j = 0; j < nDevices; ++j) {
+                if (j != device) {
+                    cudacall(cudaMemcpyPeerAsync(&yTXT[j][offset * f], j, &yTXT[device][offset * f], device, size * f * sizeof(float), stream[j + 1][device]));
+                }
+            }
+
             cudacall(cudaFree(yTX[device]));
+            cudacall(cudaDeviceSynchronize());
 
         }
 

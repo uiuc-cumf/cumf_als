@@ -212,16 +212,20 @@ LIBRARIES +=-lcublas -lcusparse #-llapack -lblas -lmagma -lm -ltest -llapacktest
 # Target rules
 all: build
 
-build: clean als als_multi2 als_mpi
+build: clean als als_multi2 als_mpi als_mpi2
 debug:	clean
 debug:	ALL_CCFLAGS+=-DDEBUG
-debug:	build 
+debug:	build
 
 als.o:als.cu
 	$(NVCC) $(INCLUDES) $(ALL_CCFLAGS) $(GENCODE_FLAGS) -lineinfo -o $@ -c $<
 als_multi2.o:als_multi2.cu
 	$(NVCC) $(INCLUDES) $(ALL_CCFLAGS) $(GENCODE_FLAGS) -lineinfo -o $@ -c $<
+als_multi3.o:als_multi3.cu
+	$(NVCC) $(INCLUDES) $(ALL_CCFLAGS) $(GENCODE_FLAGS) -lineinfo -o $@ -c $<
 als_mpi.o:als_mpi.cu
+	$(NVCC) $(INCLUDES) $(ALL_CCFLAGS) $(GENCODE_FLAGS) -lineinfo -o $@ -c $<
+als_mpi2.o:als_mpi2.cu
 	$(NVCC) $(INCLUDES) $(ALL_CCFLAGS) $(GENCODE_FLAGS) -lineinfo -o $@ -c $<
 cg.o:cg.cu
 	$(NVCC) $(INCLUDES) $(ALL_CCFLAGS) $(GENCODE_FLAGS) -lineinfo -o $@ -c $<
@@ -243,12 +247,16 @@ als: host_utilities.o device_utilities.o cg.o als.o main.o
 	$(NVCC) $(ALL_LDFLAGS) $(GENCODE_FLAGS) -lineinfo -o $@ $+ $(LIBRARIES)
 als_multi2: host_utilities.o device_utilities.o cg.o als_multi2.o main.o
 	$(NVCC) $(ALL_LDFLAGS) $(GENCODE_FLAGS) -lineinfo -o $@ $+ $(LIBRARIES)
+als_multi3: host_utilities.o device_utilities.o cg.o als_multi3.o main.o
+	$(NVCC) $(ALL_LDFLAGS) $(GENCODE_FLAGS) -lineinfo -o $@ $+ $(LIBRARIES)
 als_mpi: host_utilities.o device_utilities.o cg_mpi.o als_mpi.o main_mpi.o cuda_wrapper.o mpi_utils.o
+	mpiCC -openmp -o $@ $+ $(LIBRARIES) -L/usr/local/cuda-7.5/lib64 -lcudart -lgomp -lpthread
+als_mpi2: host_utilities.o device_utilities.o cg_mpi.o als_mpi2.o main_mpi.o cuda_wrapper.o mpi_utils.o
 	mpiCC -openmp -o $@ $+ $(LIBRARIES) -L/usr/local/cuda-7.5/lib64 -lcudart -lgomp -lpthread
 #netflix
 run: main
 	 ./main 17770 480189 100 99072112 1408395 0.048 1 3 ./data/netflix/
 clean:
-	rm -f host_utilities.o device_utilities.o als.o als_multi2.o als als_multi2 als_mpi main.o main_mpi.o cuda_wrapper.o cg.o
+	rm -f host_utilities.o device_utilities.o als.o als_multi2.o als_multi3.o als als_multi2 als_multi3 als_mpi als_mpi2 als_mpi2.o main.o main_mpi.o cuda_wrapper.o cg.o
 
 clobber: clean

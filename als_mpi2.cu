@@ -31,14 +31,16 @@
 //#define CUMF_XX_FP16
 #define CG_ITER 6
 //#define CUMF_SAVE_MODEL
-#include "als.h"
+#include "als_mpi.h"
 #include "device_utilities.h"
 #include "cg.h"
 #include "host_utilities.h"
+#include "mpi_utils.h"
 #include <fstream>
 #include <assert.h>
 #include <cuda_fp16.h>
 #include <omp.h>
+#include <pthread.h>
 #ifdef CUMF_USE_HALF
 #define SCAN_BATCH 24
 #else
@@ -531,29 +533,210 @@ get_hermitianT10(const int batch_offset, float* tt,
     }
 }
 
+typedef struct {
+    int device;
+    int mpi_rank;
+    int n_procs;
+    int batch_offset;
+    int batch_size;
+    int f;
+    cudaStream_t stream;
+    float *buff;
+} comm_arg_t;
+
+void *mpi_communicate_thread(void *arg) {
+
+    comm_arg_t *comm_arg = (comm_arg_t *) arg;
+
+    cudacall(cudaSetDevice(comm_arg->device));
+
+    size_t sz = comm_arg->batch_size * comm_arg->f;
+
+    float *tmp = (float *) malloc(sz * sizeof(float));
+    cudacall(cudaMemcpyAsync(tmp, comm_arg->buff, sz * sizeof(float), cudaMemcpyDeviceToHost, comm_arg->stream));
+    cudacall(cudaStreamSynchronize(comm_arg->stream));
+
+    void *req[comm_arg->n_procs - 1];
+
+    int cnt = 0;
+    for (int i = 0; i < comm_arg->n_procs; ++i) {
+        if (i != comm_arg->mpi_rank) {
+            //printf("Node %d send to node %d at offset %d with size %d\n", comm_arg->mpi_rank, i, comm_arg->batch_offset, sz);
+            req[cnt++] = MPI_Isend_float_wrapper(tmp, sz, i, comm_arg->batch_offset * comm_arg->f);
+        }
+    }
+
+    /*MPI_Waitall_wrapper(req, cnt);
+    printf("MPI send buffer on node %d is freed\n", comm_arg->mpi_rank);
+    free(tmp);*/
+    free(arg);
+
+    return NULL;
+}
+
+typedef struct {
+    int f;
+    int m;
+    int nDevices;
+    int device_base;
+    int X_BATCH;
+    int n_procs;
+    int mpi_rank;
+    float **XT;
+    float *XT_buff;
+} rev_x_arg_t;
+
+void *mpi_rev_x_thread(void *arg) {
+
+    rev_x_arg_t *rev_arg = (rev_x_arg_t *) arg;
+
+    int device_base = rev_arg->device_base;
+    int nDevices = rev_arg->nDevices;
+    int X_BATCH = rev_arg->X_BATCH;
+    int n_procs = rev_arg->n_procs;
+    int mpi_rank = rev_arg->mpi_rank;
+    int f = rev_arg->f;
+    int m = rev_arg->m;
+    float **XT = rev_arg->XT;
+    float *XT_buff = rev_arg->XT_buff;
+
+    cudaStream_t  stream[nDevices];
+    for (int device = 0; device < nDevices; ++device) {
+        cudacall(cudaSetDevice(device_base + device));
+
+        cudacall(cudaStreamCreate(&stream[device]));
+    }
+
+    int bound = ((X_BATCH - 1) / n_procs + 1) * (mpi_rank + 1);
+    if (bound > X_BATCH) {
+        bound = X_BATCH;
+    }
+
+    for (int batch_id = 0; batch_id < X_BATCH; ++batch_id) {
+
+        if (batch_id >= ((X_BATCH - 1) / n_procs + 1) * mpi_rank && batch_id < bound) {
+            continue;
+        }
+
+        int batch_size = 0;
+
+        if (batch_id != X_BATCH - 1) {
+            batch_size = m / X_BATCH;
+        } else {
+            batch_size = m - batch_id * (m / X_BATCH);
+        }
+
+        int batch_offset = batch_id * (m / X_BATCH);
+
+        int src = batch_id / ((X_BATCH - 1) / n_procs + 1);
+
+        //printf("Node %d receives from node %d at offset %d with size %d\n", mpi_rank, src, batch_offset, batch_size * f);
+        MPI_Recv_float_wrapper(&XT_buff[batch_offset * f], batch_size * f, src, batch_offset * f);
+
+        for (int device = 0; device < nDevices; ++device) {
+            cudacall(cudaSetDevice(device_base + device));
+
+            cudacall(cudaMemcpyAsync(&XT[device][batch_offset * f], &XT_buff[batch_offset * f], batch_size * f * sizeof(float), cudaMemcpyHostToDevice, stream[device]));
+        }
+    }
+
+    free(arg);
+    return NULL;
+}
+
+typedef struct {
+    int f;
+    int n;
+    int nDevices;
+    int device_base;
+    int THETA_BATCH;
+    int n_procs;
+    int mpi_rank;
+    float **thetaT;
+    float *thetaT_buff;
+} rev_theta_arg_t;
+
+void *mpi_rev_theta_thread(void *arg) {
+
+    rev_theta_arg_t *rev_arg = (rev_theta_arg_t *) arg;
+
+    int device_base = rev_arg->device_base;
+    int nDevices = rev_arg->nDevices;
+    int THETA_BATCH = rev_arg->THETA_BATCH;
+    int n_procs = rev_arg->n_procs;
+    int mpi_rank = rev_arg->mpi_rank;
+    int f = rev_arg->f;
+    int n = rev_arg->n;
+    float **thetaT = rev_arg->thetaT;
+    float *thetaT_buff = rev_arg->thetaT_buff;
+
+    cudaStream_t  stream[nDevices];
+    for (int device = 0; device < nDevices; ++device) {
+        cudacall(cudaSetDevice(device_base + device));
+
+        cudacall(cudaStreamCreate(&stream[device]));
+    }
+
+    int bound = ((THETA_BATCH - 1) / n_procs + 1) * (mpi_rank + 1);
+    if (bound > THETA_BATCH) {
+        bound = THETA_BATCH;
+    }
+
+    for (int batch_id = 0; batch_id < THETA_BATCH; ++batch_id) {
+
+        if (batch_id >= ((THETA_BATCH - 1) / n_procs + 1) * mpi_rank && batch_id < bound) {
+            continue;
+        }
+
+        int batch_size = 0;
+        if(batch_id != THETA_BATCH - 1) {
+            batch_size = n / THETA_BATCH;
+        } else {
+            batch_size = n - batch_id * (n / THETA_BATCH);
+        }
+        int batch_offset = batch_id * (n / THETA_BATCH);
+
+        int src = batch_id / ((THETA_BATCH - 1) / n_procs + 1);
+
+        //printf("Node %d receives from node %d at offset %d with size %d\n", mpi_rank, src, batch_offset, batch_size * f);
+        MPI_Recv_float_wrapper(&thetaT_buff[batch_offset * f], batch_size * f, src, batch_offset * f);
+
+        for (int device = 0; device < nDevices; ++device) {
+            cudacall(cudaSetDevice(device_base + device));
+
+            cudacall(cudaMemcpyAsync(&thetaT[device][batch_offset * f], &thetaT_buff[batch_offset * f], batch_size * f * sizeof(float), cudaMemcpyHostToDevice, stream[device]));
+        }
+    }
+
+    free(arg);
+    return NULL;
+}
 
 float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const float* csrValHostPtr,
         const int* cscRowIndexHostPtr, const int* cscColIndexHostPtr, const float* cscValHostPtr,
         const int* cooRowIndexHostPtr, float* thetaTHost, float* XTHost,
         const int * cooRowIndexTestHostPtr, const int * cooColIndexTestHostPtr, const float * cooValHostTestPtr,
         const int m, const int n, const int f, const long nnz, const long nnz_test, const float lambda,
-        const int ITERS, const int X_BATCH, const int THETA_BATCH)
+        const int ITERS, const int X_BATCH, const int THETA_BATCH, int mpi_rank, int n_procs)
 {
     int nDevices;
     cudacall(cudaGetDeviceCount(&nDevices));
 
+    assert(nDevices % n_procs == 0);
+    nDevices = nDevices / n_procs;
+    int device_base = mpi_rank * nDevices;
+
     omp_set_num_threads(nDevices);
 
-    cudaStream_t  stream[nDevices + 1][nDevices];
+    cudaStream_t  stream[nDevices + 2][nDevices];
     for (int device = 0; device < nDevices; ++device) {
-        cudacall(cudaSetDevice(device));
+        cudacall(cudaSetDevice(device_base + device));
 
-        for (int i = 0; i < nDevices + 1; ++i) {
+        for (int i = 0; i < nDevices + 2; ++i) {
             cudacall(cudaStreamCreate(&stream[i][device]));
         }
-    }
 
-    cudacall(cudaSetDevice(0));
+    }
 
     printf("*******parameters: m: %d, n:  %d, f: %d, nnz: %ld \n", m, n, f, nnz);
     //device pointers
@@ -575,8 +758,11 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
     float * errors_test[nDevices];
     float final_rmse = 0;
 
-    int nnz_device = (nnz - 1) / nDevices + 1;
-    int nnz_test_device = (nnz_test - 1) / nDevices + 1;
+    int nnz_node = (nnz - 1) / n_procs + 1;
+    int nnz_test_node = (nnz_test - 1) / n_procs + 1;
+
+    int nnz_device = (nnz_node - 1) / nDevices + 1;
+    int nnz_test_device = (nnz_test_node - 1) / nDevices + 1;
 
     int error_size_train = (nnz_device - 1) / 256 + 1;
     int error_size_test = (nnz_test_device - 1) / 256 + 1;
@@ -589,7 +775,7 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
     printf("*******start copying memory to GPU...\n");
 
     for (int device = 0; device < nDevices; ++device) {
-        cudacall(cudaSetDevice(device));
+        cudacall(cudaSetDevice(device_base + device));
         //dimension: M*F
         cudacall(cudaMalloc((void** ) &XT[device], f * m * sizeof(XT[0][0])));
         //dimension: F*N
@@ -635,11 +821,12 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
     	cudacall(cudaMalloc((void** ) &cscVal[device], nnz * sizeof(cscVal[0][0])));
     	cudacall(cudaMemcpy(cscVal[device], cscValHostPtr,(size_t ) (nnz * sizeof(cscVal[0][0])),cudaMemcpyHostToDevice));
 
-	    cudacall(cudaDeviceSetCacheConfig(cudaFuncCachePreferShared));
-	    //64-bit smem access
-	    //http://acceleware.com/blog/maximizing-shared-memory-bandwidth-nvidia-kepler-gpus
-	    cudaDeviceSetSharedMemConfig(cudaSharedMemBankSizeEightByte);
+        cudacall(cudaDeviceSetCacheConfig(cudaFuncCachePreferShared));
+        //64-bit smem access
+        //http://acceleware.com/blog/maximizing-shared-memory-bandwidth-nvidia-kepler-gpus
+        cudaDeviceSetSharedMemConfig(cudaSharedMemBankSizeEightByte);
     }
+
 
     //initialize cublas, cusparse
     cublasHandle_t handle[nDevices];
@@ -650,7 +837,7 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
     {
         int device = omp_get_thread_num();
 
-        cudacall(cudaSetDevice(device));
+        cudacall(cudaSetDevice(device_base + device));
 
         cublascall(cublasCreate(&handle[device]));
         cusparsecall(cusparseCreate(&cushandle[device]));
@@ -684,9 +871,8 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
         #endif
 
 		for (int device = 0; device < nDevices; ++device) {
-            cudacall(cudaSetDevice(device));
+            cudacall(cudaSetDevice(device_base + device));
 
-            cudacall(cudaMalloc((void** ) &tt[device], m / X_BATCH * f * f * sizeof(float)));
             cudacall(cudaMalloc((void** ) &ythetaT[device], f * m * sizeof(ythetaT[0][0])));
             cudacall(cudaMalloc((void** ) &ytheta[device], f * m * sizeof(ytheta[0][0])));
 
@@ -695,7 +881,7 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
         #pragma omp parallel
         {
             int device = omp_get_thread_num();
-            cudacall(cudaSetDevice(device));
+            cudacall(cudaSetDevice(device_base + device));
 
             const float alpha = 1.0f;
             const float beta = 0.0f;
@@ -718,7 +904,30 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
 
         int block_dim = f/T10*(f/T10+1)/2;
         if (block_dim < f/2) block_dim = f/2;
-        for(int batch_id_base = 0; batch_id_base < X_BATCH; batch_id_base += nDevices){
+
+        int bound = ((X_BATCH - 1) / n_procs + 1) * (mpi_rank + 1);
+        if (bound > X_BATCH) {
+            bound = X_BATCH;
+        }
+
+        float *XT_buff = (float *) malloc(f * m * sizeof(float));
+        pthread_t x_thread;
+
+        rev_x_arg_t *rev_arg = (rev_x_arg_t *) malloc(sizeof(rev_x_arg_t));
+        rev_arg->f = f;
+        rev_arg->m = m;
+        rev_arg->nDevices = nDevices;
+        rev_arg->device_base = device_base;
+        rev_arg->X_BATCH = X_BATCH;
+        rev_arg->n_procs = n_procs;
+        rev_arg->mpi_rank = mpi_rank;
+        rev_arg->XT = XT;
+        rev_arg->XT_buff = XT_buff;
+
+        assert(pthread_create(&x_thread, NULL, mpi_rev_x_thread, (void *) rev_arg) == 0);
+
+
+        for(int batch_id_base = ((X_BATCH - 1) / n_procs + 1) * mpi_rank; batch_id_base < bound; batch_id_base += nDevices){
 
             #pragma omp parallel
             {
@@ -727,12 +936,12 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
 
                 int batch_id = batch_id_base + device;
 
-                if (batch_id < X_BATCH) {
+                if (batch_id < bound) {
 
-                    cudacall(cudaSetDevice(device));
+                    cudacall(cudaSetDevice(device_base + device));
 
                     #ifdef DEBUG
-                    printf("*******batch %d / %d on device %d*******\n", batch_id, X_BATCH, device);
+                    printf("*******batch %d / %d on node %d device %d*******\n", batch_id, X_BATCH, mpi_rank, device);
                     #endif
 
                     int batch_size = 0;
@@ -741,6 +950,8 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
                     else
                         batch_size = m - batch_id*(m/X_BATCH);
                     int batch_offset = batch_id * (m/X_BATCH);
+
+                    cudacall(cudaMalloc((void** ) &tt[device], batch_size * f * f * sizeof(float)));
 
                     if(f == 100){
                         get_hermitian100<<<batch_size, 64, SCAN_BATCH * f/2 * sizeof(float2), stream[0][device]>>>
@@ -763,58 +974,77 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
 
             #pragma omp parallel
             {
-                    int device = omp_get_thread_num();
+                int device = omp_get_thread_num();
 
-                    int batch_id = batch_id_base + device;
+                int batch_id = batch_id_base + device;
 
-                    if (batch_id < X_BATCH) {
+                if (batch_id < bound) {
 
-                        cudacall(cudaSetDevice(device));
-                        cudacall(cudaStreamSynchronize(stream[0][device]));
+                    pthread_t t;
+                    comm_arg_t *comm_arg = (comm_arg_t *) malloc(sizeof(comm_arg_t));
 
-                        int batch_size = 0;
-                        if(batch_id != X_BATCH - 1)
-                            batch_size = m/X_BATCH;
-                        else
-                            batch_size = m - batch_id*(m/X_BATCH);
-                        int batch_offset = batch_id * (m/X_BATCH);
+                    cudacall(cudaSetDevice(device_base + device));
+                    cudacall(cudaStreamSynchronize(stream[0][device]));
 
-                        for (int j = 0; j < nDevices; ++j) {
-                            if (j != device) {
-                                cudacall(cudaMemcpyPeerAsync(&XT[j][batch_offset*f], j, &XT[device][batch_offset*f], device, batch_size * f * sizeof(XT[0][0]), stream[j + 1][device]));
-                            }
+                    int batch_size = 0;
+                    if(batch_id != X_BATCH - 1)
+                        batch_size = m/X_BATCH;
+                    else
+                        batch_size = m - batch_id*(m/X_BATCH);
+                    int batch_offset = batch_id * (m/X_BATCH);
+
+                    comm_arg->device = device_base + device;
+                    comm_arg->mpi_rank = mpi_rank;
+                    comm_arg->n_procs = n_procs;
+                    comm_arg->batch_offset = batch_offset;
+                    comm_arg->batch_size = batch_size;
+                    comm_arg->f = f;
+                    comm_arg->stream = stream[1][device];
+                    comm_arg->buff = &XT[device][batch_offset*f];
+
+                    assert(pthread_create(&t, NULL, mpi_communicate_thread, (void *) comm_arg) == 0);
+
+                    for (int j = 0; j < nDevices; ++j) {
+                        if (j != device) {
+                            cudacall(cudaMemcpyPeerAsync(&XT[j][batch_offset*f], j, &XT[device][batch_offset*f], device, batch_size * f * sizeof(XT[0][0]), stream[j + 2][device]));
                         }
-
                     }
+
+                    cudacall(cudaFree(tt[device]));
+
+                }
 
             }
             
         }
+
+        pthread_join(x_thread, NULL);
+
+        #pragma omp parallel
+        {
+            int device = omp_get_thread_num();
+
+            cudacall(cudaSetDevice(device_base + device));
+            cudacall(cudaDeviceSynchronize());
+
+            cudacall(cudaFree(ythetaT[device]));
+        }
+
+        free(XT_buff);
+
+        #ifdef DEBUG
+        printf("update X run %f seconds, gridSize: %d, blockSize %d.\n", seconds() - t0, m, f);
+        #endif
 
         float * xx[nDevices];
         float * yTXT[nDevices];
         float * yTX[nDevices];
 
         for (int device = 0; device < nDevices; ++device) {
-            cudacall(cudaSetDevice(device));
+            cudacall(cudaSetDevice(device_base + device));
 
             cudacall(cudaMalloc((void** ) &yTXT[device], f * n * sizeof(yTXT[0][0])));
             cudacall(cudaMalloc((void** ) &yTX[device], n * f * sizeof(yTX[0][0])));
-        }
-
-        #ifdef DEBUG
-        printf("update X run %f seconds, gridSize: %d, blockSize %d.\n", seconds() - t0, m, f);
-        #endif
-
-        #pragma omp parallel
-        {
-            int device = omp_get_thread_num();
-
-            cudacall(cudaSetDevice(device));
-            cudacall(cudaDeviceSynchronize());
-
-            cudacall(cudaFree(tt[device]));
-            cudacall(cudaFree(ythetaT[device]));
         }
 ///*
         #ifdef DEBUG
@@ -828,7 +1058,7 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
         {
             int device = omp_get_thread_num();
 
-            cudacall(cudaSetDevice(device));
+            cudacall(cudaSetDevice(device_base + device));
 
 	        const float alpha = 1.0f;
 	        const float beta = 0.0f;
@@ -848,8 +1078,28 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
         printf("\tgenerate: Y'*X run %f seconds.\n", seconds() - t1);
         #endif
 
-        //in batches, when N is huge
-        for(int batch_id_base = 0; batch_id_base < THETA_BATCH; batch_id_base += nDevices){
+        bound = ((THETA_BATCH - 1) / n_procs + 1) * (mpi_rank + 1);
+        if (bound > THETA_BATCH) {
+            bound = THETA_BATCH;
+        }
+
+        float *thetaT_buff = (float *) malloc(n * f * sizeof(float));
+        pthread_t theta_thread;
+
+        rev_theta_arg_t *theta_arg = (rev_theta_arg_t *) malloc(sizeof(rev_x_arg_t));
+        theta_arg->f = f;
+        theta_arg->n = n;
+        theta_arg->nDevices = nDevices;
+        theta_arg->device_base = device_base;
+        theta_arg->THETA_BATCH = THETA_BATCH;
+        theta_arg->n_procs = n_procs;
+        theta_arg->mpi_rank = mpi_rank;
+        theta_arg->thetaT = thetaT;
+        theta_arg->thetaT_buff = thetaT_buff;
+
+        assert(pthread_create(&theta_thread, NULL, mpi_rev_theta_thread, (void *) theta_arg) == 0);
+
+        for(int batch_id_base = ((THETA_BATCH - 1) / n_procs + 1) * mpi_rank; batch_id_base < bound; batch_id_base += nDevices){
 
             #pragma omp parallel
             {
@@ -858,9 +1108,9 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
 
                 int batch_id = batch_id_base + device;
 
-                if (batch_id < THETA_BATCH) {
+                if (batch_id < bound) {
 
-                    cudacall(cudaSetDevice(device));
+                    cudacall(cudaSetDevice(device_base + device));
 
                     #ifdef DEBUG
                     printf("*******batch %d / %d on device %d*******\n", batch_id, THETA_BATCH, device);
@@ -899,9 +1149,12 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
 
                 int batch_id = batch_id_base + device;
 
-                if (batch_id < THETA_BATCH) {
+                if (batch_id < bound) {
 
-                    cudacall(cudaSetDevice(device));
+                    pthread_t t;
+                    comm_arg_t *comm_arg = (comm_arg_t *) malloc(sizeof(comm_arg_t));
+
+                    cudacall(cudaSetDevice(device_base + device));
                     cudacall(cudaStreamSynchronize(stream[0][device]));
 
                     int batch_size = 0;
@@ -911,9 +1164,20 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
                         batch_size = n - batch_id*(n/THETA_BATCH);
                     int batch_offset = batch_id * (n/THETA_BATCH);
 
+                    comm_arg->device = device_base + device;
+                    comm_arg->mpi_rank = mpi_rank;
+                    comm_arg->n_procs = n_procs;
+                    comm_arg->batch_offset = batch_offset;
+                    comm_arg->batch_size = batch_size;
+                    comm_arg->f = f;
+                    comm_arg->stream = stream[1][device];
+                    comm_arg->buff = &thetaT[device][batch_offset*f];
+
+                    assert(pthread_create(&t, NULL, mpi_communicate_thread, (void *) comm_arg) == 0);
+
                     for (int j = 0; j < nDevices; ++j) {
                         if (j != device) {
-                            cudacall(cudaMemcpyPeerAsync(&thetaT[j][batch_offset*f], j, &thetaT[device][batch_offset*f], device, batch_size * f * sizeof(thetaT[0][0]), stream[j + 1][device]));
+                            cudacall(cudaMemcpyPeerAsync(&thetaT[j][batch_offset*f], j, &thetaT[device][batch_offset*f], device, batch_size * f * sizeof(thetaT[0][0]), stream[j + 2][device]));
                         }
                     }
 
@@ -924,15 +1188,19 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
             
         }
 
+        pthread_join(theta_thread, NULL);
+
         #pragma omp parallel
         {
             int device = omp_get_thread_num();
 
-            cudacall(cudaSetDevice(device));
+            cudacall(cudaSetDevice(device_base + device));
             cudacall(cudaDeviceSynchronize());
 
             cudacall(cudaFree(yTXT[device]));
         }
+
+        free(thetaT_buff);
 
         #ifdef DEBUG
         printf("update theta run %f seconds, gridSize: %d, blockSize %d.\n",
@@ -952,15 +1220,19 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
         {
             int device = omp_get_thread_num();
 
-            cudacall(cudaSetDevice(device));
+            cudacall(cudaSetDevice(device_base + device));
 
-            printf("Calculate partial RMSE on device %d\n", device);
+            int offset = nnz_node * mpi_rank + nnz_device * device;
 
-            int offset = nnz_device * device;
-            int bound = nnz_device * (device + 1);
+            int bound = nnz_node * mpi_rank + nnz_device * (device + 1);
+            if (bound > nnz_node * (mpi_rank + 1)) {
+                bound = nnz_node * (mpi_rank + 1);
+            }
             if (bound > nnz) {
                 bound = nnz;
             }
+
+            printf("Calculate partial RMSE on node %d device %d [%d - %d]\n", mpi_rank, device, offset, bound);
 
             RMSE_reduction2<<<error_size_train, 256, 0, stream[0][device]>>>
                     (offset, csrVal[device], cooRowIndex[device], csrColIndex[device], thetaT[device], XT[device], errors_train[device], bound, f);
@@ -969,8 +1241,12 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
 
             cudacall(cudaMemcpyAsync(rmse_train_host + device, rmse_train_device[device], sizeof(rmse_train_host[0]), cudaMemcpyDeviceToHost, stream[0][device]));
 
-            offset = nnz_test_device * device;
-            bound = nnz_test_device * (device + 1);
+            offset = nnz_test_node * mpi_rank + nnz_test_device * device;
+
+            bound = nnz_test_node * mpi_rank + nnz_test_device * (device + 1);
+            if (bound > nnz_test_node * (mpi_rank + 1)) {
+                bound = nnz_test_node * (mpi_rank + 1);
+            }
             if (bound > nnz_test) {
                 bound = nnz_test;
             }
@@ -984,30 +1260,53 @@ float doALS(const int* csrRowIndexHostPtr, const int* csrColIndexHostPtr, const 
 
         }
 
-        //#pragma omp parallel shared(rmse_train) shared(rmse_test)
-        //{
-            //int device = omp_get_thread_num();          
-		for (int device = 0; device < nDevices; ++device) {
+        float rmse_buff[n_procs][2];
+        rmse_buff[0][0] = 0.0;
+        rmse_buff[0][1] = 0.0;
 
-            cudacall(cudaSetDevice(device));
+        #pragma omp parallel
+        {
+            int device = omp_get_thread_num();          
+
+            cudacall(cudaSetDevice(device_base + device));
 
             cudaDeviceSynchronize();
 
-            rmse_train += rmse_train_host[device];
-            rmse_test += rmse_test_host[device];
+            #pragma omp atomic
+            rmse_buff[0][0] += rmse_train_host[device];
+            #pragma omp atomic
+            rmse_buff[0][1] += rmse_test_host[device];
         }
 
-        printf("--------- Train RMSE in iter %d: %f\n", iter, sqrt(rmse_train/nnz));
+        if (mpi_rank == 0) {
+            for (int i = 1; i < n_procs; ++i) {
+                MPI_Recv_float_wrapper(rmse_buff[i], 2, i, i);
+            }
+        } else {
+            MPI_Send_float_wrapper(rmse_buff[0], 2, 0, mpi_rank);
+        }
 
-        final_rmse = sqrt(rmse_test/nnz_test);
-        printf("--------- Test RMSE in iter %d: %f\n", iter, final_rmse);
+        if (mpi_rank == 0) {
+
+            for (int i = 0; i < n_procs; ++i) {
+                rmse_train += rmse_buff[i][0];
+                rmse_test += rmse_buff[i][1];
+            }
+
+            printf("--------- Train RMSE in iter %d: %f\n", iter, sqrt(rmse_train/nnz));
+
+            final_rmse = sqrt(rmse_test/nnz_test);
+            printf("--------- Test RMSE in iter %d: %f\n", iter, final_rmse);
+        }
 
 //*/        
     }
 
-    printf("%d iterations takes %lf seconds\n", ITERS, seconds() - t_itr);
+    if (mpi_rank == 0) {
+        printf("%d iterations takes %lf seconds\n", ITERS, seconds() - t_itr);
+    }
 
-    cudacall(cudaSetDevice(0));
+    cudacall(cudaSetDevice(device_base));
 
     //copy feature vectors back to host
     cudacall(cudaMemcpy(thetaTHost, thetaT[0], (size_t ) (n * f * sizeof(thetaT[0][0])), cudaMemcpyDeviceToHost));
